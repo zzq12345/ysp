@@ -1,0 +1,153 @@
+name: Build, Push and Export Docker Image
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  REGISTRY: ghcr.io  # GitHub Container Registry
+  IMAGE_NAME: ${{ github.repository }}
+  LOCAL_TAG: local-build-${{ github.run_id }}  # 本地临时标签
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # 用于 OIDC
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and Push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build local image for export
+        if: always()  # 即使推送失败也构建本地镜像
+        run: |
+          # 使用Buildx构建单架构镜像并加载到本地
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            -t ${{ env.IMAGE_NAME }}:${{ env.LOCAL_TAG }} \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            .
+          
+          # 添加导出标签
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.LOCAL_TAG }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:export-${{ github.run_id }}
+
+      - name: Save Docker image as tar file
+        if: always()
+        run: |
+          # 将镜像保存为tar文件
+          docker save ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:export-${{ github.run_id }} -o docker-image.tar
+          echo "Image saved as docker-image.tar"
+          ls -lh docker-image.tar
+
+      - name: Compress tar file
+        if: always()
+        run: |
+          # 压缩tar文件以减小大小
+          gzip docker-image.tar
+          echo "Compressed to docker-image.tar.gz"
+          ls -lh docker-image.tar.gz
+
+      - name: Upload Docker image as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: |
+            docker-image.tar.gz
+            docker-image.tar
+          retention-days: 30  # 保留30天
+          if-no-files-found: error
+
+      - name: Clean up local images
+        if: always()
+        run: |
+          # 清理本地镜像以节省空间
+          docker rmi ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:export-${{ github.run_id }} || true
+          docker rmi ${{ env.IMAGE_NAME }}:${{ env.LOCAL_TAG }} || true
+
+      - name: Output image info
+        if: github.event_name != 'pull_request' && success()
+        run: |
+          echo "Docker image built successfully!"
+          echo "Image tags:"
+          echo "${{ steps.meta.outputs.tags }}"
+          echo ""
+          echo "Artifacts generated:"
+          echo "- docker-image.tar.gz (compressed)"
+          echo "- docker-image.tar"
+          echo ""
+          echo "To pull this image from GHCR:"
+          echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo ""
+          echo "To download the artifact:"
+          echo "1. Go to this workflow run"
+          echo "2. Scroll to the bottom"
+          echo "3. Click on 'docker-image' artifact"
+          echo "4. Download the files"
+          echo ""
+          echo "To load the downloaded image:"
+          echo "  # For compressed file:"
+          echo "  docker load -i docker-image.tar.gz"
+          echo ""
+          echo "  # For uncompressed file:"
+          echo "  docker load -i docker-image.tar"
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const { repo, owner } = context.repo;
+            console.log(`Workflow failed for ${owner}/${repo}`);
+            // 这里可以添加通知逻辑，如发送邮件或Slack消息
