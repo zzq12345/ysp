@@ -1,4 +1,4 @@
-# Dockerfile
+# Dockerfile (使用 Python 3.9)
 FROM python:3.9-slim
 
 WORKDIR /app
@@ -35,6 +35,11 @@ COPY yspapp.py .
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
+# 暴露端口
+EXPOSE 8080
+
+# 运行应用
+CMD ["python", "yspapp.py"]
 # 暴露端口
 EXPOSE 8080
 
