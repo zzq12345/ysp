@@ -2,4 +2,4 @@
 construct==2.8.8
 fastapi==0.127.0
 requests==2.32.5
-uvicorn[standard]==0.40.0
+uvicorn==0.29.0  # 降级到支持 Python 3.9 的版本
