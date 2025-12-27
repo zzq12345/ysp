@@ -36,8 +36,4 @@ jobs:
         path: ysp-app-docker.tar
         retention-days: 7
     
-    - name: Push to Docker Hub (optional)
-      if: github.event_name != 'pull_request'
-      run: |
-        docker tag ysp-app:latest ${{ secrets.DOCKER_USERNAME }}/ysp-app:latest
-        docker push ${{ secrets.DOCKER_USERNAME }}/ysp-app:latest
+    
