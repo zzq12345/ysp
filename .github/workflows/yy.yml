@@ -43,12 +43,12 @@ jobs:
       - name: Set up Docker Buildx
         id: buildx-setup
         uses: docker/setup-buildx-action@v3
-        with:
-          driver: cloud
-          endpoint: "zzq12345/ysp"
-          # 如果 cloud driver 失败，回退到默认 driver
-          driver-opts: |
-            image=moby/buildkit:latest
+        # 移除 cloud driver 配置，使用默认驱动
+        # with:
+        #   driver: cloud
+        #   endpoint: "zzq12345/ysp"
+        #   driver-opts: |
+        #     image=moby/buildkit:latest
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
@@ -89,7 +89,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # 根据事件类型决定输出方式
+          # 根据事件类型决定输出方式（保留原 build.yml 的逻辑）
           outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || 'type=registry' }}
 
       - name: Build local image for export
@@ -148,10 +148,14 @@ jobs:
         run: |
           echo "======= BUILD SUMMARY ======="
           echo ""
+          echo "Repository: ${{ github.repository }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Event: ${{ github.event_name }}"
+          echo ""
           echo "GitHub Container Registry:"
           echo "  Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           
-          if [ -n "${{ env.DOCKERHUB_USER }}" ]; then
+          if [ -n "${{ env.DOCKERHUB_USER }}" ] && [ "${{ env.DOCKERHUB_USER }}" != "" ]; then
             echo ""
             echo "Docker Hub:"
             echo "  Image: ${{ env.DOCKERHUB_IMAGE_NAME }}"
@@ -163,7 +167,7 @@ jobs:
           echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | sed 's/^/  /'
           
           echo ""
-          echo "Build Driver: ${{ steps.buildx-setup.outputs.name }}"
+          echo "Build Platforms: linux/amd64, linux/arm64"
           echo "Cache Status: ${{ steps.build-push.outputs.cache-status }}"
           
           if [ "${{ github.event_name }}" != "pull_request" ]; then
@@ -179,7 +183,7 @@ jobs:
           echo "Pull from GitHub Container Registry:"
           echo "  docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           
-          if [ -n "${{ env.DOCKERHUB_USER }}" ]; then
+          if [ -n "${{ env.DOCKERHUB_USER }}" ] && [ "${{ env.DOCKERHUB_USER }}" != "" ]; then
             echo ""
             echo "Pull from Docker Hub:"
             echo "  docker pull ${{ env.DOCKERHUB_IMAGE_NAME }}:latest"
@@ -211,9 +215,18 @@ jobs:
                 owner,
                 repo,
                 title: `Build failed in workflow run #${runId}`,
-                body: `The build workflow failed. Please check the logs: ${runUrl}`,
+                body: `The build workflow failed. Please check the logs: ${runUrl}\n\nError details are available in the workflow run.`,
                 labels: ['build-failure', 'ci']
               });
             } catch (error) {
               console.log('Failed to create issue:', error.message);
             }
+
+      - name: Check for empty Docker Hub username
+        if: env.DOCKERHUB_USER == ''
+        run: |
+          echo "⚠️  WARNING: DOCKERHUB_USER is empty!"
+          echo "Docker Hub pushing will be skipped."
+          echo "To fix this, set the DOCKER_USER variable in your repository settings:"
+          echo "Settings → Secrets and variables → Actions → Variables"
+          echo "Add a variable named 'DOCKER_USER' with your Docker Hub username"
