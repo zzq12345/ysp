@@ -6,17 +6,12 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 env:
-  # 多注册中心配置
-  DOCKERHUB_USER: ${{ vars.DOCKER_USER }}
-  REGISTRY: ghcr.io  # GitHub Container Registry
+  REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   LOCAL_TAG: local-build-${{ github.run_id }}
-  
-  # Docker Hub 镜像名称配置
-  DOCKERHUB_IMAGE_NAME: ${{ vars.DOCKER_USER }}/docker-build-cloud-demo
 
 jobs:
   build-and-push:
@@ -24,7 +19,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write  # 用于 OIDC
+      id-token: write
 
     steps:
       - name: Checkout repository
@@ -41,14 +36,7 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Set up Docker Buildx
-        id: buildx-setup
         uses: docker/setup-buildx-action@v3
-        # 移除 cloud driver 配置，使用默认驱动
-        # with:
-        #   driver: cloud
-        #   endpoint: "zzq12345/ysp"
-        #   driver-opts: |
-        #     image=moby/buildkit:latest
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
@@ -58,39 +46,50 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request' && env.DOCKERHUB_USER != ''
+      - name: Log in to Docker Hub (if credentials available)
+        id: dockerhub-login
+        if: github.event_name != 'pull_request' && vars.DOCKER_USER != ''
         uses: docker/login-action@v3
         with:
-          username: ${{ env.DOCKERHUB_USER }}
+          username: ${{ vars.DOCKER_USER }}
           password: ${{ secrets.DOCKER_PAT }}
 
       - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ env.DOCKERHUB_IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag
             type=sha,prefix=
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push to multiple registries
-        id: build-push
+      - name: Build and push to GitHub Container Registry
+        id: build-push-ghcr
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64  # 多架构支持
+          platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # 根据事件类型决定输出方式（保留原 build.yml 的逻辑）
-          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || 'type=registry' }}
+
+      - name: Build and push to Docker Hub (if credentials available)
+        id: build-push-dockerhub
+        if: github.event_name != 'pull_request' && vars.DOCKER_USER != '' && steps.dockerhub-login.outcome == 'success'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ vars.DOCKER_USER }}/docker-build-cloud-demo:latest
+            ${{ vars.DOCKER_USER }}/docker-build-cloud-demo:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Build local image for export
         if: always() && github.event_name != 'pull_request'
@@ -139,9 +138,6 @@ jobs:
           # 清理本地镜像以节省空间
           docker rmi ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:export-${{ github.run_id }} 2>/dev/null || true
           docker rmi ${{ env.IMAGE_NAME }}:${{ env.LOCAL_TAG }} 2>/dev/null || true
-          
-          # 清理构建缓存
-          docker builder prune -f
 
       - name: Output build information
         if: success()
@@ -152,23 +148,23 @@ jobs:
           echo "Run ID: ${{ github.run_id }}"
           echo "Event: ${{ github.event_name }}"
           echo ""
+          
           echo "GitHub Container Registry:"
           echo "  Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           
-          if [ -n "${{ env.DOCKERHUB_USER }}" ] && [ "${{ env.DOCKERHUB_USER }}" != "" ]; then
+          if [ "${{ vars.DOCKER_USER }}" != "" ]; then
             echo ""
             echo "Docker Hub:"
-            echo "  Image: ${{ env.DOCKERHUB_IMAGE_NAME }}"
-            echo "  User: ${{ env.DOCKERHUB_USER }}"
+            echo "  Image: ${{ vars.DOCKER_USER }}/docker-build-cloud-demo"
+            echo "  User: ${{ vars.DOCKER_USER }}"
+          else
+            echo ""
+            echo "Docker Hub: Skipped (no DOCKER_USER variable set)"
           fi
           
           echo ""
-          echo "Generated Tags:"
+          echo "Generated GHCR Tags:"
           echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | sed 's/^/  /'
-          
-          echo ""
-          echo "Build Platforms: linux/amd64, linux/arm64"
-          echo "Cache Status: ${{ steps.build-push.outputs.cache-status }}"
           
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo ""
@@ -183,10 +179,10 @@ jobs:
           echo "Pull from GitHub Container Registry:"
           echo "  docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           
-          if [ -n "${{ env.DOCKERHUB_USER }}" ] && [ "${{ env.DOCKERHUB_USER }}" != "" ]; then
+          if [ "${{ vars.DOCKER_USER }}" != "" ]; then
             echo ""
             echo "Pull from Docker Hub:"
-            echo "  docker pull ${{ env.DOCKERHUB_IMAGE_NAME }}:latest"
+            echo "  docker pull ${{ vars.DOCKER_USER }}/docker-build-cloud-demo:latest"
           fi
           
           if [ "${{ github.event_name }}" != "pull_request" ]; then
@@ -196,37 +192,22 @@ jobs:
             echo "  2. docker load -i docker-image.tar.gz"
           fi
 
-      - name: Notify on failure
-        if: failure()
-        uses: actions/github-script@v6
-        with:
-          script: |
-            const { repo, owner } = context.repo;
-            const runId = context.runId;
-            const runUrl = `https://github.com/${owner}/${repo}/actions/runs/${runId}`;
-            
-            console.log(`Workflow failed for ${owner}/${repo}`);
-            console.log(`Run URL: ${runUrl}`);
-            
-            // 可以添加通知逻辑，如发送邮件或Slack消息
-            // 示例: 创建 issue 通知构建失败
-            try {
-              await github.rest.issues.create({
-                owner,
-                repo,
-                title: `Build failed in workflow run #${runId}`,
-                body: `The build workflow failed. Please check the logs: ${runUrl}\n\nError details are available in the workflow run.`,
-                labels: ['build-failure', 'ci']
-              });
-            } catch (error) {
-              console.log('Failed to create issue:', error.message);
-            }
-
-      - name: Check for empty Docker Hub username
-        if: env.DOCKERHUB_USER == ''
+      - name: Setup instructions for Docker Hub
+        if: vars.DOCKER_USER == ''
         run: |
-          echo "⚠️  WARNING: DOCKERHUB_USER is empty!"
-          echo "Docker Hub pushing will be skipped."
-          echo "To fix this, set the DOCKER_USER variable in your repository settings:"
-          echo "Settings → Secrets and variables → Actions → Variables"
-          echo "Add a variable named 'DOCKER_USER' with your Docker Hub username"
+          echo ""
+          echo "======= DOCKER HUB SETUP ======="
+          echo ""
+          echo "To enable Docker Hub pushes, set up the following:"
+          echo ""
+          echo "1. Go to your repository settings:"
+          echo "   Settings → Secrets and variables → Actions"
+          echo ""
+          echo "2. Add a VARIABLE (not secret):"
+          echo "   Name: DOCKER_USER"
+          echo "   Value: Your Docker Hub username"
+          echo ""
+          echo "3. Add a SECRET:"
+          echo "   Name: DOCKER_PAT"
+          echo "   Value: Your Docker Hub Personal Access Token"
+          echo "   (Create one at: https://hub.docker.com/settings/security)"
