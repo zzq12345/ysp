@@ -1,0 +1,219 @@
+name: Build, Push and Export Docker Image test
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  # 多注册中心配置
+  DOCKERHUB_USER: ${{ vars.DOCKER_USER }}
+  REGISTRY: ghcr.io  # GitHub Container Registry
+  IMAGE_NAME: ${{ github.repository }}
+  LOCAL_TAG: local-build-${{ github.run_id }}
+  
+  # Docker Hub 镜像名称配置
+  DOCKERHUB_IMAGE_NAME: ${{ vars.DOCKER_USER }}/docker-build-cloud-demo
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # 用于 OIDC
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Set up Docker Buildx
+        id: buildx-setup
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: cloud
+          endpoint: "zzq12345/ysp"
+          # 如果 cloud driver 失败，回退到默认 driver
+          driver-opts: |
+            image=moby/buildkit:latest
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request' && env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKER_PAT }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.DOCKERHUB_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push to multiple registries
+        id: build-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64  # 多架构支持
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 根据事件类型决定输出方式
+          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || 'type=registry' }}
+
+      - name: Build local image for export
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          # 构建单架构镜像用于本地导出
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            -t ${{ env.IMAGE_NAME }}:${{ env.LOCAL_TAG }} \
+            --cache-from type=gha \
+            .
+          
+          # 为导出添加标签
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.LOCAL_TAG }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:export-${{ github.run_id }}
+
+      - name: Save Docker image as tar file
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          # 将镜像保存为tar文件
+          docker save ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:export-${{ github.run_id }} -o docker-image.tar
+          echo "Image saved as docker-image.tar"
+          ls -lh docker-image.tar
+
+      - name: Compress tar file
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          # 压缩tar文件以减小大小
+          gzip docker-image.tar
+          echo "Compressed to docker-image.tar.gz"
+          ls -lh docker-image.tar.gz
+
+      - name: Upload Docker image as artifact
+        if: always() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: |
+            docker-image.tar.gz
+            docker-image.tar
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Clean up local images
+        if: always()
+        run: |
+          # 清理本地镜像以节省空间
+          docker rmi ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:export-${{ github.run_id }} 2>/dev/null || true
+          docker rmi ${{ env.IMAGE_NAME }}:${{ env.LOCAL_TAG }} 2>/dev/null || true
+          
+          # 清理构建缓存
+          docker builder prune -f
+
+      - name: Output build information
+        if: success()
+        run: |
+          echo "======= BUILD SUMMARY ======="
+          echo ""
+          echo "GitHub Container Registry:"
+          echo "  Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          
+          if [ -n "${{ env.DOCKERHUB_USER }}" ]; then
+            echo ""
+            echo "Docker Hub:"
+            echo "  Image: ${{ env.DOCKERHUB_IMAGE_NAME }}"
+            echo "  User: ${{ env.DOCKERHUB_USER }}"
+          fi
+          
+          echo ""
+          echo "Generated Tags:"
+          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | sed 's/^/  /'
+          
+          echo ""
+          echo "Build Driver: ${{ steps.buildx-setup.outputs.name }}"
+          echo "Cache Status: ${{ steps.build-push.outputs.cache-status }}"
+          
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo ""
+            echo "Artifacts Generated:"
+            echo "  - docker-image.tar.gz (compressed)"
+            echo "  - docker-image.tar"
+          fi
+          
+          echo ""
+          echo "======= USAGE INSTRUCTIONS ======="
+          echo ""
+          echo "Pull from GitHub Container Registry:"
+          echo "  docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          
+          if [ -n "${{ env.DOCKERHUB_USER }}" ]; then
+            echo ""
+            echo "Pull from Docker Hub:"
+            echo "  docker pull ${{ env.DOCKERHUB_IMAGE_NAME }}:latest"
+          fi
+          
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo ""
+            echo "Download and load artifact:"
+            echo "  1. Download artifact from workflow run"
+            echo "  2. docker load -i docker-image.tar.gz"
+          fi
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const { repo, owner } = context.repo;
+            const runId = context.runId;
+            const runUrl = `https://github.com/${owner}/${repo}/actions/runs/${runId}`;
+            
+            console.log(`Workflow failed for ${owner}/${repo}`);
+            console.log(`Run URL: ${runUrl}`);
+            
+            // 可以添加通知逻辑，如发送邮件或Slack消息
+            // 示例: 创建 issue 通知构建失败
+            try {
+              await github.rest.issues.create({
+                owner,
+                repo,
+                title: `Build failed in workflow run #${runId}`,
+                body: `The build workflow failed. Please check the logs: ${runUrl}`,
+                labels: ['build-failure', 'ci']
+              });
+            } catch (error) {
+              console.log('Failed to create issue:', error.message);
+            }
